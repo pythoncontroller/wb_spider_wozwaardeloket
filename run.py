@@ -10,6 +10,7 @@ Gebruik:
     python run.py --postcode 1017AB
     python run.py --postcode 1017AB --huisnummer 10
     python run.py --adres "Dam 1 Amsterdam"
+    python run.py --gemeente Velsen
     python run.py --postcodes-file postcodes.txt
     python run.py --bulk --from-id 0 --to-id 100000
 """
@@ -276,6 +277,102 @@ class WozScraper:
             logger.error("Database fout: %s", e)
             return False
 
+    def zoek_alle_adressen_gemeente(self, gemeentenaam, postcodes=None):
+        """Zoek alle adressen in een gemeente via PDOK Locatieserver met paginatie.
+
+        Als postcodes meegegeven worden, wordt per postcode gezocht.
+        Anders wordt op gemeentenaam gezocht (max ~10.000 resultaten).
+        """
+        alle_adressen = []
+
+        if postcodes:
+            # Per 4-cijferige postcode zoeken (betrouwbaarder voor grote gemeenten)
+            for i, pc in enumerate(postcodes):
+                logger.info(
+                    "--- Gemeente %s - postcode %s (%d/%d) ---",
+                    gemeentenaam, pc, i + 1, len(postcodes),
+                )
+                adressen = self._zoek_adressen_paginated(
+                    query=f"postcode:{pc}",
+                    filters=[f"gemeentenaam:{gemeentenaam}", "type:adres"],
+                )
+                alle_adressen.extend(adressen)
+        else:
+            # Zoek direct op gemeentenaam
+            adressen = self._zoek_adressen_paginated(
+                query=gemeentenaam,
+                filters=[f"gemeentenaam:{gemeentenaam}", "type:adres"],
+            )
+            alle_adressen.extend(adressen)
+
+        # Dedupliceer op nummeraanduiding_id
+        seen = set()
+        uniek = []
+        for a in alle_adressen:
+            nid = a.get("nummeraanduiding_id")
+            if nid and nid not in seen:
+                seen.add(nid)
+                uniek.append(a)
+
+        logger.info(
+            "Gemeente %s: %d unieke adressen gevonden",
+            gemeentenaam, len(uniek),
+        )
+        return uniek
+
+    def _zoek_adressen_paginated(self, query, filters):
+        """Zoek adressen met paginatie (PDOK max 100 per request, start max 10.000)."""
+        alle_docs = []
+        start = 0
+        rows = 100
+
+        while start < 10000:
+            params = {
+                "q": query,
+                "fl": (
+                    "id,weergavenaam,straatnaam,huisnummer,huisletter,"
+                    "huisnummertoevoeging,postcode,woonplaatsnaam,"
+                    "gemeentenaam,nummeraanduiding_id"
+                ),
+                "rows": rows,
+                "start": start,
+            }
+
+            # PDOK free endpoint ondersteunt meerdere fq parameters via lijst
+            try:
+                resp = self.session.get(
+                    PDOK_FREE_URL,
+                    params=[("q", query)] + [("fq", f) for f in filters] + [
+                        ("fl", params["fl"]),
+                        ("rows", str(rows)),
+                        ("start", str(start)),
+                    ],
+                    timeout=REQUEST_TIMEOUT,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+            except requests.RequestException as e:
+                logger.error("PDOK paginatie mislukt bij start=%d: %s", start, e)
+                break
+
+            response = data.get("response", {})
+            num_found = response.get("numFound", 0)
+            docs = response.get("docs", [])
+
+            alle_docs.extend(docs)
+            logger.info(
+                "  PDOK pagina start=%d: %d resultaten (totaal beschikbaar: %d)",
+                start, len(docs), num_found,
+            )
+
+            if len(docs) < rows or start + rows >= num_found:
+                break
+
+            start += rows
+            self._rate_limit()
+
+        return alle_docs
+
     # --- Methode 2: Legacy WFS endpoint (bulk scraping) ---
 
     def _init_wfs_session(self):
@@ -440,6 +537,75 @@ def scrape_postcodes_bestand(bestandspad, delay=RATE_LIMIT_DELAY):
     logger.info("Klaar: totaal %d adressen opgeslagen voor %d postcodes", totaal, len(postcodes))
 
 
+# Bekende postcodes per gemeente (voor efficiente paginatie)
+GEMEENTE_POSTCODES = {
+    "Velsen": [
+        "1950", "1951",  # Velsen-Noord
+        "1970", "1971", "1972", "1973", "1974", "1975", "1976",  # IJmuiden
+        "1980", "1981",  # Velsen-Zuid
+        "1985",  # Driehuis
+        "1990", "1991", "1992",  # Velserbroek
+        "2070", "2071",  # Santpoort-Noord / Santpoort-Zuid
+        "2080", "2082",  # Santpoort-Noord / omgeving
+    ],
+}
+
+
+def scrape_gemeente(gemeentenaam, delay=RATE_LIMIT_DELAY):
+    """Scrape alle WOZ waarden voor een hele gemeente."""
+    scraper = WozScraper(delay=delay)
+    postcodes = GEMEENTE_POSTCODES.get(gemeentenaam)
+
+    logger.info("=== Start scraping gemeente %s ===", gemeentenaam)
+    if postcodes:
+        logger.info("Bekende postcodes: %s", ", ".join(postcodes))
+    else:
+        logger.info("Geen voorgedefinieerde postcodes, zoek direct op gemeentenaam")
+
+    adressen = scraper.zoek_alle_adressen_gemeente(gemeentenaam, postcodes=postcodes)
+
+    if not adressen:
+        logger.warning("Geen adressen gevonden voor gemeente %s", gemeentenaam)
+        return 0
+
+    logger.info("Start WOZ waarden ophalen voor %d adressen...", len(adressen))
+    opgeslagen = 0
+    fouten = 0
+    overgeslagen = 0
+
+    for i, adres in enumerate(adressen):
+        if (i + 1) % 50 == 0 or i == 0:
+            logger.info(
+                "--- Voortgang: %d/%d adressen (%d opgeslagen, %d overgeslagen, %d fouten) ---",
+                i + 1, len(adressen), opgeslagen, overgeslagen, fouten,
+            )
+
+        nid = adres.get("nummeraanduiding_id")
+        if not nid:
+            fouten += 1
+            continue
+
+        # Skip als al in database
+        if WozWaarde.select().where(WozWaarde.nummeraanduiding_id == nid).exists():
+            overgeslagen += 1
+            continue
+
+        woz_data = scraper.haal_woz_waarde(nid)
+        if woz_data:
+            if scraper._sla_woz_op(adres, woz_data):
+                opgeslagen += 1
+            else:
+                fouten += 1
+        else:
+            fouten += 1
+
+    logger.info(
+        "=== Gemeente %s klaar: %d opgeslagen, %d overgeslagen, %d fouten van %d adressen ===",
+        gemeentenaam, opgeslagen, overgeslagen, fouten, len(adressen),
+    )
+    return opgeslagen
+
+
 def scrape_bulk_wfs(from_id=0, to_id=100000, step=5000, threads=4, delay=RATE_LIMIT_DELAY):
     """Bulk scrape via legacy WFS endpoint (object ID ranges)."""
     scraper = WozScraper(delay=delay)
@@ -476,35 +642,63 @@ def scrape_bulk_wfs(from_id=0, to_id=100000, step=5000, threads=4, delay=RATE_LI
 
 
 def exporteer_csv(output_pad="woz_export.csv"):
-    """Exporteer WOZ data naar CSV bestand."""
-    records = WozWaarde.select()
-    count = records.count()
-    if count == 0:
+    """Exporteer WOZ data naar CSV bestand met WOZ waarden per jaar in aparte kolommen."""
+    records = list(WozWaarde.select())
+    if not records:
         logger.warning("Geen data om te exporteren")
         return
 
+    # Verzamel alle unieke peildatums voor kolomnamen
+    alle_peildatums = set()
+    for r in records:
+        if r.woz_waarden_json:
+            try:
+                waarden = json.loads(r.woz_waarden_json)
+                for w in waarden:
+                    if w.get("peildatum"):
+                        alle_peildatums.add(w["peildatum"])
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+    peildatums_gesorteerd = sorted(alle_peildatums)
+
     with open(output_pad, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f, delimiter=";")
-        writer.writerow([
+
+        # Header met dynamische peildatum kolommen
+        header = [
             "nummeraanduiding_id", "woz_object_nummer",
             "straatnaam", "huisnummer", "huisletter", "huisnummer_toevoeging",
             "postcode", "woonplaats",
             "gebruiksdoel", "oppervlakte", "bouwjaar",
-            "laatste_peildatum", "laatste_woz_waarde",
-            "alle_woz_waarden",
-        ])
+        ]
+        for pd in peildatums_gesorteerd:
+            header.append(f"woz_{pd}")
+        writer.writerow(header)
 
         for r in records:
-            writer.writerow([
+            # Parse WOZ waarden per peildatum
+            waarden_per_datum = {}
+            if r.woz_waarden_json:
+                try:
+                    waarden = json.loads(r.woz_waarden_json)
+                    for w in waarden:
+                        if w.get("peildatum"):
+                            waarden_per_datum[w["peildatum"]] = w.get("waarde", "")
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+            row = [
                 r.nummeraanduiding_id, r.woz_object_nummer,
                 r.straatnaam, r.huisnummer, r.huisletter, r.huisnummer_toevoeging,
                 r.postcode, r.woonplaats,
                 r.gebruiksdoel, r.oppervlakte, r.bouwjaar,
-                r.laatste_peildatum, r.laatste_woz_waarde,
-                r.woz_waarden_json,
-            ])
+            ]
+            for pd in peildatums_gesorteerd:
+                row.append(waarden_per_datum.get(pd, ""))
+            writer.writerow(row)
 
-    logger.info("Geexporteerd: %d records naar %s", count, output_pad)
+    logger.info("Geexporteerd: %d records naar %s (met %d peiljaren)", len(records), output_pad, len(peildatums_gesorteerd))
 
 
 def main():
@@ -516,6 +710,7 @@ Voorbeelden:
   python run.py --postcode 1017AB
   python run.py --postcode "1017 AB" --huisnummer 10
   python run.py --adres "Dam 1 Amsterdam"
+  python run.py --gemeente Velsen
   python run.py --postcodes-file postcodes.txt
   python run.py --bulk --from-id 0 --to-id 100000 --threads 4
   python run.py --export woz_export.csv
@@ -525,6 +720,7 @@ Voorbeelden:
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--postcode", help="Zoek op postcode (bijv. 1017AB)")
     group.add_argument("--adres", help="Zoek op adres tekst (bijv. 'Dam 1 Amsterdam')")
+    group.add_argument("--gemeente", help="Scrape hele gemeente (bijv. Velsen)")
     group.add_argument("--postcodes-file", help="Bestand met postcodes (1 per regel)")
     group.add_argument("--bulk", action="store_true", help="Bulk scrape via WFS (legacy methode)")
     group.add_argument("--export", nargs="?", const="woz_export.csv", help="Exporteer naar CSV")
@@ -544,6 +740,8 @@ Voorbeelden:
         scrape_postcode(args.postcode, huisnummer=args.huisnummer, delay=args.delay)
     elif args.adres:
         scrape_adres(args.adres, delay=args.delay)
+    elif args.gemeente:
+        scrape_gemeente(args.gemeente, delay=args.delay)
     elif args.postcodes_file:
         scrape_postcodes_bestand(args.postcodes_file, delay=args.delay)
     elif args.bulk:
